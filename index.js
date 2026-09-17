@@ -121,12 +121,17 @@ app.get('/api/medicamentos', async (_req, res) => {
      ) r ON r.medicamento_id = m.id
      ORDER BY m.nombre`
   );
-  res.json(filas.map((p) => ({
-    ...p,
-    requiereReceta: !!p.requiere_receta,
-    precio: Number(p.precio),
-    disponible: Number(p.disponible)
-  })));
+  res.json(filas.map((p) => {
+    const { requiere_receta, fecha_caducidad, codigo_barras, ...resto } = p;
+    return {
+      ...resto,
+      requiereReceta: !!requiere_receta,
+      fechaCaducidad: fecha_caducidad ? new Date(fecha_caducidad).toISOString().slice(0, 10) : null,
+      codigoBarras: codigo_barras,
+      precio: Number(p.precio),
+      disponible: Number(p.disponible)
+    };
+  }));
 });
 
 app.post('/api/medicamentos', async (req, res) => {
@@ -226,6 +231,45 @@ app.put('/api/tickets/:folio/confirmar-entrega', async (req, res) => {
 });
 
 // --------------------------------------------------------------- Ventas ----
+// Venta directa en mostrador (POS): sin ticket previo, descuenta inventario de inmediato.
+app.post('/api/ventas', async (req, res) => {
+  const { items, recetaVerificada } = req.body;
+  const total = items.reduce((acc, i) => acc + i.precio * i.cantidadSeleccionada, 0);
+  const id = `POS-${Date.now().toString(36).toUpperCase().slice(-6)}`;
+
+  const conexion = await pool.getConnection();
+  try {
+    await conexion.beginTransaction();
+    for (const item of items) {
+      const [[producto]] = await conexion.query('SELECT cantidad, fecha_caducidad FROM medicamentos WHERE id = ? FOR UPDATE', [item.id]);
+      if (!producto) throw new Error('Producto no encontrado');
+      if (new Date(producto.fecha_caducidad) < new Date()) throw new Error(`${item.nombre ?? item.id} está caducado`);
+      if (producto.cantidad < item.cantidadSeleccionada) throw new Error(`Sin existencias suficientes de ${item.nombre ?? item.id}`);
+      await conexion.query('UPDATE medicamentos SET cantidad = cantidad - ? WHERE id = ?', [item.cantidadSeleccionada, item.id]);
+    }
+    await conexion.query(
+      'INSERT INTO ventas (id, ticket_folio, total, origen, receta_verificada) VALUES (?, NULL, ?, ?, ?)',
+      [id, total, 'Punto de venta', !!recetaVerificada]
+    );
+    // Reutilizamos ticket_detalle para guardar el detalle de la venta (ticket_folio = id de la venta)
+    await conexion.query('INSERT INTO tickets (folio, total, estado) VALUES (?, ?, ?)', [id, total, 'Entregado']);
+    for (const item of items) {
+      await conexion.query(
+        'INSERT INTO ticket_detalle (ticket_folio, medicamento_id, cantidad, precio_unitario) VALUES (?, ?, ?, ?)',
+        [id, item.id, item.cantidadSeleccionada, item.precio]
+      );
+    }
+    await conexion.query('UPDATE ventas SET ticket_folio = ? WHERE id = ?', [id, id]);
+    await conexion.commit();
+  } catch (error) {
+    await conexion.rollback();
+    conexion.release();
+    return res.status(400).json({ ok: false, error: error.message || 'No se pudo procesar la venta.' });
+  }
+  conexion.release();
+  res.status(201).json({ ok: true, id });
+});
+
 app.get('/api/ventas', async (_req, res) => {
   const [ventas] = await pool.query('SELECT * FROM ventas ORDER BY fecha DESC');
   const conItems = await Promise.all(
