@@ -104,9 +104,29 @@ app.put('/api/usuarios/:id/password', async (req, res) => {
 });
 
 // --------------------------------------------------------- Medicamentos ----
+// "disponible" = cantidad real menos lo reservado por tickets pendientes de recolección
+// (que aún no se descuentan del inventario hasta que se confirma la entrega). Se calcula
+// aquí en el servidor para no tener que exponerle a cada cliente los tickets de los demás.
 app.get('/api/medicamentos', async (_req, res) => {
-  const [filas] = await pool.query('SELECT * FROM medicamentos ORDER BY nombre');
-  res.json(filas.map((p) => ({ ...p, requiereReceta: !!p.requiere_receta, precio: Number(p.precio) })));
+  const [filas] = await pool.query(
+    `SELECT m.*,
+            GREATEST(0, m.cantidad - COALESCE(r.reservado, 0)) AS disponible
+     FROM medicamentos m
+     LEFT JOIN (
+       SELECT d.medicamento_id, SUM(d.cantidad) AS reservado
+       FROM ticket_detalle d
+       JOIN tickets t ON t.folio = d.ticket_folio
+       WHERE t.estado = 'Pendiente de Recolección'
+       GROUP BY d.medicamento_id
+     ) r ON r.medicamento_id = m.id
+     ORDER BY m.nombre`
+  );
+  res.json(filas.map((p) => ({
+    ...p,
+    requiereReceta: !!p.requiere_receta,
+    precio: Number(p.precio),
+    disponible: Number(p.disponible)
+  })));
 });
 
 app.post('/api/medicamentos', async (req, res) => {
@@ -216,6 +236,26 @@ app.get('/api/ventas', async (_req, res) => {
   );
   res.json(conItems);
 });
+
+// ------------------------------------------------- Auto-cancelación 48h ----
+// Antes vivía en el navegador (dependía de tener la app abierta); ahora corre en el
+// servidor real, así que aplica sin importar si algún cliente tiene la app abierta.
+const HORAS_LIMITE_RECOLECCION = 48;
+const cancelarTicketsVencidos = async () => {
+  try {
+    await pool.query(
+      `UPDATE tickets
+       SET estado = 'Cancelado'
+       WHERE estado = 'Pendiente de Recolección'
+         AND fecha <= (NOW() - INTERVAL ? HOUR)`,
+      [HORAS_LIMITE_RECOLECCION]
+    );
+  } catch (error) {
+    console.error('Error al cancelar tickets vencidos:', error.message);
+  }
+};
+cancelarTicketsVencidos();
+setInterval(cancelarTicketsVencidos, 15 * 60 * 1000);
 
 const PUERTO = process.env.PORT || 3000;
 app.listen(PUERTO, () => console.log(`HealthPharma API escuchando en el puerto ${PUERTO}`));
